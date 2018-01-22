@@ -33,7 +33,7 @@ namespace Microsoft.Diagnostics.Tracing
             // Also add Operating system name, machine name.
             // Ideally events about loaded Dlls.  
             // Memory size, 
-            _processId = 0xFFFE;    // Arbitrary
+            _processId = 0; // V1 && V2 tests expect 0 for process Id
             _processName = "ProcessBeingTraced";
             osVersion = new Version("0.0.0.0");
             cpuSpeedMHz = 10;
