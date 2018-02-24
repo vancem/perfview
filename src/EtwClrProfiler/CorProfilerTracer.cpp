@@ -34,8 +34,8 @@ class ClassInfo
 {
 public:
 	ClassInfo() {
-		ID = 0; Token = 0; ModuleInfo = NULL; Size = 0; Flags = (CorTypeAttr) 0; Name = NULL; 
-		elemType=ELEMENT_TYPE_END; elemClassId = 0; rank = 0; 
+		ID = 0; Token = 0; ModuleInfo = NULL; Flags = (CorTypeAttr) 0; Name = NULL; 
+		IsArray = false; elemType = ELEMENT_TYPE_END; elemClassId = 0; rank = 0;
 		TickOfCurrentTimeBucket = 0; AllocCountInCurrentBucket = 0; AllocPerMSec = 0; SamplingRate = 0; AllocsIgnored = 0; IgnoredSize = 0;
 		ForceKeepSize = 10000;			// By default we keep all instances greater than 10K for all types.  
 	}
@@ -52,7 +52,6 @@ public:
 
 	// Only set if this is a normal class
 	mdTypeDef Token;
-	ULONGLONG Size;
 	CorTypeAttr Flags;
 	ModuleInfo* ModuleInfo;     // We don't own this pointer (we don't delete it when we die)
 
@@ -419,7 +418,7 @@ void CorProfilerTracer :: DumpClassInfo( )
 	for(auto classIter = m_classInfo.begin(); classIter != m_classInfo.end(); classIter++)
 	{
 		ClassInfo* classInfo = classIter->second;
-		EventWriteClassIDDefintionEvent(classInfo->ID, classInfo->Token, classInfo->Flags, classInfo->ModuleInfo->ID, classInfo->Name);
+		EventWriteClassIDDefintionEvent(classInfo->ID, classInfo->Token, classInfo->Flags, (classInfo->ModuleInfo != 0 ? classInfo->ModuleInfo->ID : 0), classInfo->Name);
 	}
 }
 
@@ -475,9 +474,6 @@ STDMETHODIMP CorProfilerTracer::ObjectAllocated(ObjectID objectId, ClassID class
 
 	// We do this for also  the side effect of logging the class  
 	ClassInfo* classInfo = GetClassInfo(classId);
-	if (classInfo == 0)			// TODO FIX NOW, we should log something.  
-		goto Done;
-
 	if (m_smartSampling)
 	{
 		classInfo->AllocsIgnored++;
@@ -643,11 +639,8 @@ STDMETHODIMP CorProfilerTracer::ObjectReferences(ObjectID objectId, ClassID clas
 	// LOG_TRACE(L"ObjectReferences\n");
 
 	// We do this for the side effect of logging the class  
-	ClassInfo* classInfo = GetClassInfo(classId);
-	/** TODO FIX NOW 
-	if (classInfo == NULL)
-	return E_FAIL;
-	**/
+	GetClassInfo(classId);
+
 	ULONG size = 0;
 	m_info->GetObjectSize(objectId, &size);
 
@@ -688,13 +681,11 @@ ClassInfo* CorProfilerTracer::GetClassInfo(ClassID classId)
 {
 	// Have I already looked up this class? 
 	ClassInfo*& classInfo = m_classInfo[classId];
+
 	if (classInfo == NULL)
-		classInfo = new ClassInfo();
-	if (classInfo->ID == -1)     // We failed to get info on the class. 
-		return NULL;
-	if (classInfo->ID == 0)
 	{
-		classInfo->ID = -1;
+		classInfo = new ClassInfo();
+		classInfo->ID = classId;
 		DWORD classFlags = 0;           // TODO FIX NOW, set class flags properly.  
 		ModuleID moduleId = 0;
 
@@ -719,14 +710,12 @@ ClassInfo* CorProfilerTracer::GetClassInfo(ClassID classId)
 				*ptr++ = ',';
 			*ptr++ = ']';
 			*ptr = '\0';
-			classInfo->ID = classId;
 		}
 		else 
 		{
 			ULONG numFields;
 			ULONG size;
 			m_info->GetClassLayout(classId, 0, 0, &numFields, &size);
-			classInfo->Size = size;
 
 			HRESULT hr = m_info->GetClassIDInfo(classId, &moduleId, &classInfo->Token);
 			if (moduleId != 0)
@@ -745,37 +734,38 @@ ClassInfo* CorProfilerTracer::GetClassInfo(ClassID classId)
 
 						// Actually get the name 
 						classInfo->Name = new wchar_t[classNameLength];
-						hr = moduleInfo->MetaDataImport->GetTypeDefProps (classInfo->Token, classInfo->Name, classNameLength, &classNameLength, &classFlagsBuff, &baseClass);
-						if (hr == S_OK)
-							classInfo->ID = classId;
+						moduleInfo->MetaDataImport->GetTypeDefProps (classInfo->Token, classInfo->Name, classNameLength, &classNameLength, &classFlagsBuff, &baseClass);
 					}
 				}
 			}
 		}
+
+		// If we don't have a name, make one up.  
 		if (classInfo->Name == NULL)
 		{
-			classInfo->Name = new wchar_t[2];
-			wcscpy_s(classInfo->Name, 2, L"?");
+			wchar_t classIdStr[32];
+			_itow_s(classId, classIdStr, sizeof(classIdStr), 16);
+
+			int classIdNameLen = wcslen(classIdStr) + 9; // type<0x> = 8 chars + null.  
+			classInfo->Name = new wchar_t[classIdNameLen];
+			wcscat_s(classInfo->Name, classIdNameLen, L"type<0x");
+			wcscat_s(classInfo->Name, classIdNameLen, classIdStr);
+			wcscat_s(classInfo->Name, classIdNameLen, L">");
+			assert(wcslen(classInfo->Name) == classIdNameLen);
 		}
 
+#ifdef PIN_INVESTIGATION
 		// For our experimentation we keep all Byte[] 
 		// TODO FIX NOW remove after experimentation (actually make it so that it is configurable).  
-#ifdef PIN_INVESTIGATION
 		classInfo->ForceKeepSize = 1000000000;
 		if (wcscmp(classInfo->Name, L"System.Byte[]") == 0)
 		 	classInfo->ForceKeepSize = 0x100;
 		else if (wcsstr(classInfo->Name, L"OverlappedData") != NULL)
 		 	classInfo->ForceKeepSize = 0x0;
 #endif 
+		EventWriteClassIDDefintionEvent(classInfo->ID, classInfo->Token, classFlags, moduleId, classInfo->Name);
+		m_classInfo[classId] = classInfo;
 
-		if (classInfo->ID != -1)
-		{
-			EventWriteClassIDDefintionEvent(classInfo->ID, classInfo->Token, classFlags, moduleId, classInfo->Name);
-		}
-		else 
-		{
-			LOG_TRACE(L"Error getting information for class ID 0x%x\n", classId);
-		}
 	}
 
 	return classInfo;
