@@ -91,19 +91,12 @@ namespace PerfView
             // Determine if we are on a 64 bit system.
             if (Environment.Is64BitOperatingSystem)
             {
-                // TODO FIX NOW.   Find a way of determing which architecture a dump is
-                try
+                log.WriteLine("********** TRYING TO OPEN THE DUMP AS 64 BIT ************");
+                bool retry = DumpGCHeap("/processDump " + qualifiers, processDumpFile, outputFile, log, ProcessorArchitecture.Amd64);
+                if (retry)
                 {
-                    log.WriteLine("********** TRYING TO OPEN THE DUMP AS 64 BIT ************");
-                    DumpGCHeap("/processDump " + qualifiers, processDumpFile, outputFile, log, ProcessorArchitecture.Amd64);
-                    return; // Yeah! success the first time
-                }
-                catch (ApplicationException)
-                {
-                    // It might have failed because this was a 32 bit dump, if so try again.  
-                    log.WriteLine("********** TRYING TO OPEN THE DUMP AS 32 BIT ************");
+                    log.WriteLine("************ Detected a 32 bit process dump, opening as a 32 bit dump.");
                     DumpGCHeap("/processDump" + qualifiers, processDumpFile, outputFile, log, ProcessorArchitecture.X86);
-                    return;
                 }
             }
             else
@@ -152,7 +145,13 @@ namespace PerfView
         }
 
         #region private
-        private static void DumpGCHeap(string qualifiers, string inputArg, string outputFile, TextWriter log, ProcessorArchitecture arch)
+
+        /// <summary>
+        /// Tries to dump a GC Heap, passing 'qualifiers to the 'HeapDump' command.  
+        /// If you don't know whether the dump is a 32 or 64 bit dump, try a 64 bit architecture.  It will
+        /// This method returns true if you should retry as a 32 bit dump.   
+        /// </summary>
+        private static bool DumpGCHeap(string qualifiers, string inputArg, string outputFile, TextWriter log, ProcessorArchitecture arch)
         {
             var directory = arch == ProcessorArchitecture.X86 ? "x86" : "amd64";
             var heapDumpExe = Path.Combine(SupportFiles.SupportFileDir, Path.Combine(directory, "HeapDump.exe"));
@@ -173,13 +172,14 @@ namespace PerfView
             var cmd = Command.Run(commandLine, options);
             if (cmd.ExitCode != 0)
             {
+                if (cmd.ExitCode == 5)  // This is the special exit code that means 'tried to open a 32 bit dump'
+                    return true;
                 throw new ApplicationException("HeapDump failed with exit code " + cmd.ExitCode);
             }
 
             if (log != null)
-            {
                 log.WriteLine("Completed Heap Dump for {0} to {1}", inputArg, outputFile);
-            }
+            return false; 
         }
 
         /// <summary>

@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Microsoft.Diagnostics.HeapDump;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -214,9 +215,20 @@ internal class Program
             else if (processDump)
             {
                 Console.WriteLine("Creating heap dump {0} from process dump {1}.", outputFile, inputSpec);
-
-                dumper.DumpHeapFromProcessDump(inputSpec, outputFile);
-                // TODO FIX NOW REMOVE GCHeap.DumpHeapFromProcessDump(inputSpec, outputFile, Console.Out);
+                try
+                {
+                    dumper.DumpHeapFromProcessDump(inputSpec, outputFile);
+                    // TODO FIX NOW REMOVE GCHeap.DumpHeapFromProcessDump(inputSpec, outputFile, Console.Out);
+                }
+                catch (HeapDumpException ex)
+                {
+                    if (ex.HResult == (int) HR.Opening32BitDumpIn64BitProcess)
+                    {
+                        Console.WriteLine("Trying to open a 32 bit dump in a 64 bit process, returning special exit code 5");
+                        return 5;
+                    }
+                    throw;
+                }
             }
             else
             {
