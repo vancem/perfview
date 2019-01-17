@@ -36,6 +36,7 @@ namespace Microsoft.Diagnostics.Tracing
                 gcReferenceComputer = new GCReferenceComputer(source);
             }
 
+            m_callStackCache = new CallStackCache();
             m_gcReferenceComputer = gcReferenceComputer;
 
             m_source = source;
@@ -344,19 +345,13 @@ namespace Microsoft.Diagnostics.Tracing
             TraceActivity activity = GetCurrentActivity(thread);
             CallStackIndex callStack = data.CallStackIndex();
 
-            // Insure we have a cache
-            if (m_callStackCache == null && !NoCache)
-            {
-                m_callStackCache = new CallStackCache();
-            }
-
             if (trimEtwFrames)
             {
                 callStack = TrimETWFrames(callStack);
             }
 
             m_curEvent = data;
-
+            m_recursion = 0;
             return GetCallStackWithActivityFrames(callStack, activity, topFrames);
         }
 
@@ -369,13 +364,8 @@ namespace Microsoft.Diagnostics.Tracing
             Debug.Assert(outputStackSource.TraceLog == m_eventLog);
             m_outputSource = outputStackSource;
 
-            // Insure we have a cache
-            if (m_callStackCache == null && !NoCache)
-            {
-                m_callStackCache = new CallStackCache();
-            }
-
             m_curEvent = null;
+            m_recursion = 0;
             return GetCallStackWithActivityFrames(CallStackIndex.Invalid, activity, topFrames);
         }
 
@@ -414,10 +404,23 @@ namespace Microsoft.Diagnostics.Tracing
         }
 
         /// <summary>
-        /// If set, we don't assume that the top top frames are an attribute of the TOP THREAD  (if they vary based on
-        /// the current activity, then you can't cache.   Setting this disables caching.  
+        /// We assume that the top frames are dependent ONLY of the TraceActivity (chunk of a Thread).   If the top-frames
+        /// change WITHIN the current TraceActivity (which they easily could), you are responsible for clearing
+        /// the cache whenever the top-frames change (within that activity). 
+        /// things that var
         /// </summary>
-        public bool NoCache;
+        public void ClearCache()
+        {
+            m_callStackCache.ClearStackEntries();
+        }
+
+        // This is the amount of task recursion you allow (one task calling another), AFTER
+        // you eliminate simple 'tail recursive' cases (which are pretty common and long).
+        // Note that ETW cuts of stacks at 200 frames.   Thus 500 Tasks (each of which may have
+        // several frames) should be plenty (and that does not even include the tail recursion)
+        // If you make this too big the display will get slow.  Values over 2000 might start
+        // causing stack overflows.   
+        const ushort MaxTaskRecursion = 30; // TODO FIX NOW, 10 for debugging, 100-500 is reasonable.  
 
         #region Private
         // When we stop because we notice we are in the threadpool, then we need to auto-start it
@@ -573,24 +576,30 @@ namespace Microsoft.Diagnostics.Tracing
         }
 
         /// <summary>
-        /// This cache remembers Activity * CallStackIndex pairs and the result.  
+        /// This cache remembers Activity * CallStackIndex pairs and the resulting StackSourceCallStackIndex
+        /// It also remembers some intermediate results like the LogicalCreator and LogicalStackAtCreation
+        /// because these don't get invalidated by 'ClearStackEntries' and are pretty important to avoid
+        /// VERY long processing in activities that tail-call a lot (which does happen). 
         /// </summary>
         private class CallStackCache : MutableTraceEventStackSource.CallStackMap
         {
             public CallStackCache()
             {
                 CurrentActivityIndex = ActivityIndex.Invalid;       // You have to set this before calling get or put.  
-                Entries = new CacheEntry[CacheSize];
-                for (int i = 0; i < Entries.Length; i++)
+                Debug.Assert(((CacheSize - 1) & CacheSize) == 0);   // Enforce that the Cache Size is a power of two.  
+                _entries = new CacheEntry[CacheSize];
+                for (int i = 0; i < _entries.Length; i++)
                 {
-                    Entries[i] = new CacheEntry() { ActivityIndex = ActivityIndex.Invalid };
+                    _entries[i] = new CacheEntry() { _fromActivityIndex = ActivityIndex.Invalid };
                 }
 
-                Clock = 0;
+                _discardEntry = new CacheEntry();
             }
 
+            #region CallStackMap interface support 
             /// <summary>
             /// Remembers the current Activity for 'Get' and 'Put' operations.   Needs to be set before Get or Put is called.  
+            /// Note that we can't add this to the Get and Put operations because they are part of the CallStackMap interface.  
             /// </summary>
             public ActivityIndex CurrentActivityIndex;
 
@@ -603,44 +612,20 @@ namespace Microsoft.Diagnostics.Tracing
             public StackSourceCallStackIndex Get(CallStackIndex fromStackIndex)
             {
                 Debug.Assert(CurrentActivityIndex != ActivityIndex.Invalid);
-                Clock++;
-                int hash = ((int)CurrentActivityIndex + (int)fromStackIndex) & CachMask;
-                CacheEntry entry = Entries[hash];
-                if (entry.ActivityIndex == CurrentActivityIndex && entry.FromStackIndex == fromStackIndex)
-                {
-                    entry.LastHitClock = Clock;
-                    return entry.ToStackIndex;
-                }
+                CacheEntry entry = GetEntry(fromStackIndex, CurrentActivityIndex);
+                if (entry != null)
+                    return entry._toTaskIndex;
                 return StackSourceCallStackIndex.Invalid;
             }
-            /// <summary>
-            /// updates the cache entry for the CurrnetActivityIndex with the call stack 'fromStackIndex'  with the value 
-            /// 'toStackIndex'
-            /// 
-            /// This is not passed the CurrentActivityIndex, so it can implement the CallStackMap interface
-            /// </summary>
+
             public void Put(CallStackIndex fromStackIndex, StackSourceCallStackIndex toStackIndex)
             {
                 Debug.Assert(CurrentActivityIndex != ActivityIndex.Invalid);
-                int hash = ((int)CurrentActivityIndex + (int)fromStackIndex) & CachMask;
-                CacheEntry entry = Entries[hash];
-                if (entry.DeathAge < Clock - entry.LastHitClock) // if we have not used it recently, pitch it and reuse the entry
-                {
-                    entry.ActivityIndex = CurrentActivityIndex;
-                    entry.FromStackIndex = fromStackIndex;
-                    entry.ToStackIndex = toStackIndex;
-                    entry.LastHitClock = Clock;
-                    entry.DeathAge = 0;                         // By default we evict aggressively (next hit)
-                    if ((Clock & 3) == 0)                       // Every 4th entry we let live longer
-                    {
-                        entry.DeathAge = 10;
-                        if ((Clock & 16) == 0)                  // Every 16th entry we let longer still.  
-                        {
-                            entry.DeathAge = 50;
-                        }
-                    }
-                }
+                CacheEntry entry = GetEntryForUpdate(fromStackIndex, CurrentActivityIndex);
+                entry._toTaskIndex = toStackIndex;
             }
+
+            #endregion 
 
             // For debugging only, it is expensive
             public int NumEntries
@@ -648,9 +633,9 @@ namespace Microsoft.Diagnostics.Tracing
                 get
                 {
                     int ret = 0;
-                    for (int i = 0; i < Entries.Length; i++)
+                    for (int i = 0; i < _entries.Length; i++)
                     {
-                        if (Entries[i].ActivityIndex != ActivityIndex.Invalid)
+                        if (_entries[i]._fromActivityIndex != ActivityIndex.Invalid)
                         {
                             ret++;
                         }
@@ -660,29 +645,135 @@ namespace Microsoft.Diagnostics.Tracing
                 }
             }
 
-            public void Clear()
+            /// <summary>
+            /// Clears the 'final stack entry (but not the logical creator information) in the stack.
+            /// This is appropriate when the topStacks information changes (e.g. when a start or stop
+            /// happens in the start-stop view)
+            /// </summary>
+            public void ClearStackEntries()
             {
-                for (int i = 0; i < Entries.Length; i++)
+                for (int i = 0; i < _entries.Length; i++)
                 {
-                    Entries[i].ActivityIndex = ActivityIndex.Invalid;
+                    ref CacheEntry entry = ref _entries[i];
+                    entry._toTaskIndex = StackSourceCallStackIndex.Invalid;
+                    entry._deathAge = 0;
                 }
+            }
+
+            /// <summary>
+            /// Returns the cached information associated the stack represented by 'fromStackIndex' and 'activityIndex'.
+            /// Returns null if not found.
+            /// </summary>
+            internal CacheEntry GetEntry(CallStackIndex fromStackIndex, ActivityIndex activityIndex)
+            {
+                Debug.Assert(activityIndex != ActivityIndex.Invalid);
+
+                _gets++;
+                if ((_gets & (GetsPerClockTick - 1)) == 0)
+                    _clock++;
+                int hash = ((int)activityIndex + (int)fromStackIndex + ((int)fromStackIndex << 3)) & CacheMask;
+                CacheEntry entry = _entries[hash];
+                if (entry._fromActivityIndex == activityIndex && entry._fromStackIndex == fromStackIndex)
+                {
+                    entry._deathAge |= 32;               // this has proven useful keep it around longer as well as resetting the last hit.  
+                    entry._lastHitCount = _clock;
+                    return entry;
+                }
+                return null;
+            }
+
+            /// <summary>
+            /// Looks for a entry for the information associated with the stack represented by fromStackIndex and activityIndex.
+            /// The entry can then be filled in with the information.  This routine never returns null.  
+            /// </summary>
+            internal CacheEntry GetEntryForUpdate(CallStackIndex fromStackIndex, ActivityIndex activityIndex)
+            {
+                _gets++;
+                if ((_gets & (GetsPerClockTick - 1)) == 0)
+                    _clock++;
+                int hash = ((int)activityIndex + (int)fromStackIndex + ((int)fromStackIndex << 3)) & CacheMask;
+                CacheEntry entry = _entries[hash];
+
+                // TODO FIX NOW DISABLE CACHE.  
+                entry = _discardEntry;
+                entry._initialized = false;
+                entry._toTaskIndex = StackSourceCallStackIndex.Invalid;
+                entry._taskDepth = 0;
+                entry._logicalCreator = null;
+                entry._logicalStackAtCreation = CallStackIndex.Invalid;
+                entry._stackStop = CallStackIndex.Invalid;
+                entry._fromActivityIndex = activityIndex;
+                entry._fromStackIndex = fromStackIndex;
+                return entry;
+
+                if (entry._fromStackIndex != fromStackIndex || entry._fromActivityIndex != activityIndex)
+                {
+                    if (entry._deathAge < ((ushort)(_clock - entry._lastHitCount))) // if we have not used it recently, pitch it and reuse the entry
+                    {
+                        entry._lastHitCount = _clock;
+                        entry._deathAge = 0;                         // By default we evict aggressively (next hit)
+                        if ((_clock & 0x4) == 0)                     // Every 4th entry we let live longer
+                        {
+                            entry._deathAge = 4;                     // this will last several call stacks 
+                            if ((_clock & 0x1F) == 0)                // Every 32nd entry we let longer still.  
+                                entry._deathAge = 32;
+                        }
+                    }
+                    else
+                    {
+                        entry = _discardEntry;
+                    }
+
+                    entry._initialized = false;
+                    entry._toTaskIndex = StackSourceCallStackIndex.Invalid;
+                    entry._taskDepth = 0;
+                    entry._logicalCreator = null;
+                    entry._logicalStackAtCreation = CallStackIndex.Invalid;
+                    entry._stackStop = CallStackIndex.Invalid;
+                    entry._fromActivityIndex = activityIndex;
+                    entry._fromStackIndex = fromStackIndex;
+                }
+                else
+                    entry._deathAge |= 32;                           // this has proven useful keep it around longer as well as resetting the last hit.  
+
+                return entry;
             }
 
             #region private
             private const int CacheSize = 4096 * 4;                 // Must be a power of 2
-            private const int CachMask = CacheSize - 1;
+            private const int CacheMask = CacheSize - 1;
+            private const ushort GetsPerClockTick = 32;             // The size of a typical stack, on the small side.   Must be a power of 2.             
 
-            private class CacheEntry
+            internal class CacheEntry
             {
-                public ActivityIndex ActivityIndex;
-                public CallStackIndex FromStackIndex;
-                public StackSourceCallStackIndex ToStackIndex;
-                public ushort LastHitClock;                 // used to decide who to evict.  
-                public ushort DeathAge;                     // if you are older than this die.  
+                // The first two entries are a logical stack 
+                internal CallStackIndex _fromStackIndex;         // The stack starts here
+                internal ActivityIndex _fromActivityIndex;       // After FromStack, the rest of the stack is where this activity was created.  
+
+                // These two entries represent the stack at creation time (same convention)
+                // However this stack also removes recursion.  Thus if one activity spawns itself (common) we have 
+                // eliminated that part of the stack (since it can be arbitrarily long). 
+                // Not this does not depend on the 'topFrames' and thus caches perfectly (never needs to be discarded)
+                internal TraceActivity _logicalCreator;
+                internal CallStackIndex _logicalStackAtCreation;
+                internal CallStackIndex _stackStop;
+
+                // This is the final StackSourceStack for the original stack (which was in pieces).  Note
+                // however that this depends on the 'topFrames' and thus might be invalidated if the top-frames
+                // change (e.g. when start or stop events happen).   Thus this is more fragile.  
+                internal StackSourceCallStackIndex _toTaskIndex;
+                internal ushort _taskDepth;                  // This is the depth in Task recursions.  We wish to limit this to MaxTaskRecursion so the viewer does not slow down.   
+                internal bool _initialized;
+
+                // internal variables to decide who to evict when we need to add a new entry.  
+                internal ushort _lastHitCount;               // used to decide who to evict.  
+                internal ushort _deathAge;                   // if you are older than this die.  
             }
 
-            private ushort Clock;                                   // Counts how many times we use the cache
-            private CacheEntry[] Entries;
+            private ushort _gets;                            // This is advanced every Get operation 
+            private ushort _clock;                           // Counts how many times we use the cache
+            private CacheEntry[] _entries;
+            internal CacheEntry _discardEntry;              // returned by GetEntryForUpdate when there is no free cache entry.
             #endregion
         }
 
@@ -1010,84 +1101,217 @@ namespace Microsoft.Diagnostics.Tracing
 #endif
 
         /// <summary>
-        /// if 'activity' has not creator (it is top-level), then return baseStack (near execution) followed by 'top' representing the thread-process frames.
+        /// if 'activity' does not have a creator (it is top-level), then return baseStack (near execution) followed by 'top' representing the thread-process frames.
         /// 
         /// otherwise, find the fragment of 'baseStack' up to the point to enters the threadpool (the user code) and splice it to the stack of the creator
         /// of the activity and return that.  (thus returning your full user-stack).  
+        /// 
+        /// You have to set the m_recursion field to 0 before calling this routine.   You can inspect  m_retTaskDepth after the call returns.  
         /// </summary>
-        private StackSourceCallStackIndex GetCallStackWithActivityFrames(CallStackIndex baseStack, TraceActivity activity, Func<TraceThread, StackSourceCallStackIndex> topFrames)
+        private StackSourceCallStackIndex GetCallStackWithActivityFrames(CallStackIndex stackStart, TraceActivity activity, Func<TraceThread, StackSourceCallStackIndex> topFrames)
         {
-            StackSourceCallStackIndex ret = StackSourceCallStackIndex.Invalid;
-            if (m_callStackCache != null)
-            {
-                // Indicate to the cache what activity we are in.  'baseStacks' fragments in the same activity, are assumed to be the same.  
-                m_callStackCache.CurrentActivityIndex = activity.Index;
+            CallStackCache.CacheEntry entry = m_callStackCache.GetEntryForUpdate(stackStart, activity.Index);
 
-                // We keep a cache so to speed things up quite a bit.  
-                ret = m_callStackCache.Get(baseStack);
-                if (ret != StackSourceCallStackIndex.Invalid)
+            // We have a cached final result!  Yeah, we are done!
+            if (entry._toTaskIndex != StackSourceCallStackIndex.Invalid)
+            {
+                // We put things in the cache if TaskDepth < MaxTaskRecursion and it does NOT have an overflow frame OR MaxTaskRecursion <= TaskDepth and it DOES have an overflow frame.
+                // Given OUR m_recursion variable see if what is cached matches what we actually want.  
+                if (entry._taskDepth + m_recursion < MaxTaskRecursion ||     // We DON'T want an overflow frame (and the cache also does not have one)
+                    MaxTaskRecursion <= entry._taskDepth)                    // We DO want an overflow frame (and the cache has one)
                 {
-                    return ret;
+                    // Trace.WriteLine("Hit cache for " + activity.Index + " " + startStack);
+                    m_retTaskDepth = entry._taskDepth;
+                    m_overflowFrame = MaxTaskRecursion <= entry._taskDepth;
+                    return entry._toTaskIndex;
                 }
+                // else
+                //Trace.WriteLine("Cache missed because of recursion frame " + activity.Index + " " + stackStart);
             }
 
-            TraceActivity creatorActivity = activity.Creator;
-            if (creatorActivity != null)
+            string error = null;
+            if (!entry._initialized) // If we did not find info, initialize it.  
             {
-                // Trim off the frames that just represent the logging of the ETW event.  They are not interesting.   
-                CallStackIndex creationStackFragment = TrimETWFrames(activity.CreationCallStackIndex);
-                StackSourceCallStackIndex fullCreationStack = GetCallStackWithActivityFrames(creationStackFragment, creatorActivity, topFrames);
-                if (m_callStackCache != null)
-                {
-                    m_callStackCache.CurrentActivityIndex = activity.Index;     // GetCallStackWithActivityFrames sets the current activity, set it back.  
-                }
+                error = GetLogicalCreatorCallStack(stackStart, activity, ref entry._logicalCreator, ref entry._logicalStackAtCreation, ref entry._stackStop);
+                entry._initialized = true;
+            }
 
-                // We also wish to trim off the top of the tail, that is 'above' (closer to root) than the transition from the threadPool Execute (Run) method. 
-                CallStackIndex threadPoolTransition = CallStackIndex.Invalid;
-                if (baseStack != CallStackIndex.Invalid)    // If we have a stack at all.  
+            if (entry._logicalCreator != null)
+            {
+                CallStackIndex stackStop = entry._stackStop;
+                StackSourceCallStackIndex fullCreationStack;
+                m_recursion++;
+                if (MaxTaskRecursion <= m_recursion)
                 {
-                    threadPoolTransition = FindThreadPoolTransition(baseStack);
-                    if (threadPoolTransition == CallStackIndex.Invalid)
+                    // Give up and simply show the stacks from the activities throw the thread and process node.    
+                    fullCreationStack = GetTopStacksForThread(activity.Thread, topFrames);
+
+                    // Add a frame that says we had to limit recursion and this is not our real creator.  
+                    fullCreationStack = m_outputSource.Interner.CallStackIntern(m_outputSource.Interner.FrameIntern("ERROR_EXCESSIVE_TASK_RECURSION"), fullCreationStack);
+                    entry._taskDepth = m_retTaskDepth = 0;
+                    m_overflowFrame = true;
+                    //Trace.WriteLine("LOGGING EXCESSIVE_TASK_RECURSION frame " + activity.Index + " " + stackStart);
+                    entry = null; // We never want to cache this entry.  
+                }
+                else
+                {
+                    // Call ourselves recursively to get the tail 'close to threadStart' part of the stack.   
+                    fullCreationStack = GetCallStackWithActivityFrames(entry._logicalStackAtCreation, entry._logicalCreator, topFrames);
+
+                    m_retTaskDepth++;
+
+                    // We only add the frame to the if 
+                    //     TaskDepth < MaxTaskRecursion and we did NOT add an EXCESSIVE TASK RECURSION frame or
+                    //   MaxTaskRecursion <= TaskDepth and we did add an EXCESSIVE TASK RECURSION frame
+                    bool myReturnNeedsOverflowFrame = (MaxTaskRecursion <= m_retTaskDepth);
+                    if (m_overflowFrame == myReturnNeedsOverflowFrame)
+                        entry._taskDepth = m_retTaskDepth;
+                    else
                     {
-                        // We did not find a transition, give up, if the stack was unbroken, then we assume the task ended.  
-                        goto DontMorph;
+                        entry = null;       // This means don't set the cache.  
+                        //Trace.WriteLine("Avoiding caching of stacks associated with " + activity.Index + " " + stackStart);
                     }
+
+                    // Add a frame that shows that we are starting a task 
+                    fullCreationStack = m_outputSource.Interner.CallStackIntern(m_outputSource.Interner.FrameIntern("STARTING TASK"), fullCreationStack);
                 }
-
-                // If baseStack is recursive with the frame we already have, do nothing.  
-                StackSourceFrameIndex taskMarkerFrame = IsRecursiveTask(baseStack, threadPoolTransition, fullCreationStack);
-                if (taskMarkerFrame != StackSourceFrameIndex.Invalid)
-                {
-                    return fullCreationStack;
-                }
-
-                // Add a frame that shows that we are starting a task 
-                // We dont like to add the thread ID because it inhibits folding, but it is useful for debugging so we leave it 
-                // in the debug build.   
-#if THREAD_ID_ON_TASK_START
-                StackSourceFrameIndex threadFrameIndex = m_outputSource.Interner.FrameIntern("STARTING TASK on Thread " + activity.Thread.ThreadID.ToString());
-#else
-                StackSourceFrameIndex threadFrameIndex = m_outputSource.Interner.FrameIntern("STARTING TASK");
-#endif
-                fullCreationStack = m_outputSource.Interner.CallStackIntern(threadFrameIndex, fullCreationStack);
-
-                // and take the region between creationStackFragment and threadPoolTransition and concatenate it to fullCreationStack.  
-                return SpliceStack(baseStack, threadPoolTransition, fullCreationStack);
-            }
-
-            DontMorph:
-            StackSourceCallStackIndex rootFrames;
-            if (topFrames != null)
-            {
-                rootFrames = topFrames(activity.Thread);
+                // and take the region between start and stops where we enter the thread pool and concatenate it to fullCreationStack.  
+                var ret = SpliceStack(stackStart, stackStop, fullCreationStack, entry);
+                return ret;
             }
             else
             {
-                rootFrames = m_outputSource.GetCallStackForThread(activity.Thread);
+                // This is the top most activity, there is no splicing, just to the 'normal' stack processing.  
+                m_callStackCache.CurrentActivityIndex = activity.Index;
+                entry._toTaskIndex = m_outputSource.GetCallStack(stackStart, GetTopStacksForThread(activity.Thread, topFrames, error), m_callStackCache);
+                entry._taskDepth = m_retTaskDepth = 0;
+                m_overflowFrame = true;
+                return entry._toTaskIndex;
+            }
+        }
+
+        private StackSourceCallStackIndex GetTopStacksForThread(TraceThread thread, Func<TraceThread, StackSourceCallStackIndex> topFrames, string errorFrame = null)
+        {
+            StackSourceCallStackIndex ret;
+            if (topFrames != null)
+                ret = topFrames(thread);
+            else
+                ret = m_outputSource.GetCallStackForThread(thread);
+
+            if (errorFrame != null)
+                ret = m_outputSource.Interner.CallStackIntern(m_outputSource.Interner.FrameIntern(errorFrame), ret);
+            return ret;
+        }
+
+        /// <summary>
+        /// Given the stack represented by 'startStack' and 'activity' see if there is a creator activity and if return three pieces of information
+        ///  * logicalCreator -> The activity that created  'activity' 
+        ///  * logicalStackAtCreation -> The stack fragment where 'activity' was created.  This does not include the ETW logging frames.   
+        ///  * stackStop -> the transition from 'startStack' where it enters the thread pool 
+        ///  
+        /// Note that this is the 'logical' creator because we skip recursion.   If the current activity is the same as the creator activity 
+        /// then we skip that creator and look at its creator.  Thus we remove recursion.  
+        /// 
+        /// It returns a string that indicates any error that happened, or null if it is successful.  
+        /// </summary> 
+        private string GetLogicalCreatorCallStack(CallStackIndex startStack, TraceActivity activity, ref TraceActivity logicalCreator, ref CallStackIndex logicalStackAtCreation, ref CallStackIndex stackStopRet)
+        {
+            CallStackIndex stackToCache = CallStackIndex.Invalid;
+            TraceActivity activityToCache = null;
+            CallStackIndex stackStopToCache = CallStackIndex.Invalid;
+
+            CallStackIndex stackStop;
+            string error = null;
+
+            Debug.Assert(activity != null);
+            for (int recCount = 0; ; recCount++)
+            {
+                // Set logical Creator 
+                logicalCreator = activity.Creator;
+                if (logicalCreator == null)
+                    return null;
+
+                // We place an upper bound on how many recursive task we scan in case there
+                // is bad data that has loops in the creator tree.   
+                if (recCount >= 10000)
+                {
+                    // If we change this so that logicalCreator != null, we need to change the caller
+                    logicalCreator = null;
+                    error = "ERROR_EXCESSIVE_TASK_SIMPLE_RECURSION";
+                    break;
+                }
+
+                //Trace.WriteLine("GetLogicalCreatorStack " + activity.Index + " " + startStack + " recCount " + recCount + " depth " + m_recursion);
+
+                // Set the startStack return value.   
+                if (startStack != CallStackIndex.Invalid)
+                {
+                    stackStop = FindThreadPoolTransition(startStack);
+                    if (stackStop == CallStackIndex.Invalid)
+                    {
+                        // We could not find a thread pool transition.  This is probably a broken stack.  
+                        // Today we complete give up on stack stitching.   We may wish to revisit this.  
+                        // If we change this so that logicalCreator != null, we need to change the caller
+                        logicalCreator = null;
+                        error = "ERROR_NO_THREADPOOL_TRANSITION";
+                        break;
+                    }
+                }
+                else
+                    stackStop = CallStackIndex.Invalid;
+
+                // The stackStopRet value is only for the original stackStart variable.   
+                // Thus only set it the first time through.  
+                if (recCount == 0)
+                    stackStopRet = stackStop;
+
+                // We cache the 4th entry so that if we have sibling activities 
+                // that they don't need to do the whole recursion chain again.  
+                // We need the final values (which we don't have yet) so we just
+                // remember what the inputs were and add these to the cache before
+                // we return.  
+                if (recCount == 3)
+                {
+                    stackToCache = startStack;
+                    activityToCache = activity;
+                    stackStopToCache = stackStop;
+                }
+
+
+                // Set logicalStack At creation time.  
+                logicalStackAtCreation = TrimETWFrames(activity.CreationCallStackIndex);
+
+                // If we are not recursive we are done. 
+                if (logicalCreator.Creator == null || !IsRecursiveTask(startStack, stackStop, logicalStackAtCreation))
+                    break;
+
+                // Skip this creator it looks just like us (recursion).    
+                startStack = logicalStackAtCreation;
+                activity = logicalCreator;
+
+                // See if we have cached the answer.  
+                var entry = m_callStackCache.GetEntry(startStack, activity.Index);
+                if (entry != null && entry._initialized)
+                {
+                    //Trace.WriteLine("Found IN CACHE " + activity.Index + " " + startStack + " recCount " + recCount);
+                    logicalCreator = entry._logicalCreator;
+                    logicalStackAtCreation = entry._logicalStackAtCreation;
+                    stackStop = entry._stackStop;
+                    break;
+                }
             }
 
-            ret = m_outputSource.GetCallStack(baseStack, rootFrames, m_callStackCache);
-            return ret;
+            // Also cache a entry that is 4 away.  This makes it pretty unlikely that we have to traverse large changes multiple times. 
+            if (activityToCache != null)
+            {
+                var addEntry = m_callStackCache.GetEntryForUpdate(stackToCache, activityToCache.Index);
+                //Trace.WriteLine("ADDING " + activityToCache.Index + " " + stackToCache);
+                addEntry._stackStop = stackStopToCache;
+                addEntry._logicalCreator = logicalCreator;
+                addEntry._logicalStackAtCreation = logicalStackAtCreation;
+                addEntry._initialized = true;
+            }
+            return error;
         }
 
         /* Support functions for GetCallStack */
@@ -1134,85 +1358,74 @@ namespace Microsoft.Diagnostics.Tracing
         }
 
         /// <summary>
-        /// If the stack from 'startStack' (closest to execution) through 'stopStack' is the same as 'baseStack' return a non-invalid frame 
-        /// indicating that it is recursive and should be dropped.  The frame index returned is the name of the task on 'baseStack' that
-        /// begins the recursion (so you can update it if necessary)
+        /// If the stack from 'startStack' (closest to execution) through 'stopStack' is the same as 'parentStack'
+        /// (and that the next frame on 'parentStack is a ThreadPoolTransition.  
+        /// 
+        /// Basically this indicates that the stack chunk associated with 'curStack' is identical to its parent
+        /// activity (thus it is recursive), (and can be omitted).  
         /// </summary>
-        private StackSourceFrameIndex IsRecursiveTask(CallStackIndex startStack, CallStackIndex stopStack, StackSourceCallStackIndex baseStack)
+        private bool IsRecursiveTask(CallStackIndex curStack, CallStackIndex stopStack, CallStackIndex parentStack)
         {
-            CallStackIndex newStacks = startStack;
-            StackSourceCallStackIndex existingStacks = baseStack;
-            for (; ; )
+            return false; // TODO FIX NOW FOR TESTING.
+            while (true)
             {
-                if (newStacks == CallStackIndex.Invalid)
-                {
-                    return StackSourceFrameIndex.Invalid;
-                }
-
-                if (existingStacks == StackSourceCallStackIndex.Invalid)
-                {
-                    return StackSourceFrameIndex.Invalid;
-                }
-
-                if (newStacks == stopStack)
-                {
+                if (curStack == CallStackIndex.Invalid)
+                    return false;
+                if (parentStack == CallStackIndex.Invalid)
+                    return false;
+                if (curStack == stopStack)
                     break;
-                }
 
-                StackSourceFrameIndex existingFrameIdx = m_outputSource.GetFrameIndex(existingStacks);
+                CodeAddressIndex parentCodeAddressIdx = m_eventLog.CallStacks.CodeAddressIndex(parentStack);
+                CodeAddressIndex curCodeAddressIdx = m_eventLog.CallStacks.CodeAddressIndex(curStack);
+                if (curCodeAddressIdx == CodeAddressIndex.Invalid || parentCodeAddressIdx == CodeAddressIndex.Invalid)
+                    return false;
 
-                var newFrameCodeAddressIndex = m_eventLog.CallStacks.CodeAddressIndex(newStacks);
-                if (newFrameCodeAddressIndex == CodeAddressIndex.Invalid)
+                if (parentCodeAddressIdx != curCodeAddressIdx)
                 {
-                    return StackSourceFrameIndex.Invalid;
+                    if (m_eventLog.CodeAddresses.MethodIndex(parentCodeAddressIdx) != m_eventLog.CodeAddresses.MethodIndex(parentCodeAddressIdx))
+                        return false;
+                    if (m_eventLog.CodeAddresses.ModuleFileIndex(parentCodeAddressIdx) != m_eventLog.CodeAddresses.ModuleFileIndex(parentCodeAddressIdx))
+                        return false;
                 }
 
-                StackSourceFrameIndex newFrameIdx = m_outputSource.GetFrameIndex(newFrameCodeAddressIndex);
-                if (newFrameIdx != existingFrameIdx)
-                {
-                    // Currently we only recognize something as recursive when the frame IDs match.  
-                    // It is true most of the time that names are interned (thus if names match IDs will
-                    // match) but it is not enforced and might not be true all the time.  If this causes
-                    // problems we can revisit.
-                    return StackSourceFrameIndex.Invalid;
-                }
-
-                existingStacks = m_outputSource.GetCallerIndex(existingStacks);
-                newStacks = m_eventLog.CallStacks.Caller(newStacks);
+                parentStack = m_eventLog.CallStacks.Caller(parentStack);
+                curStack = m_eventLog.CallStacks.Caller(curStack);
             }
 
-            var frameIdx = m_outputSource.GetFrameIndex(existingStacks);
-            var frameName = m_outputSource.GetFrameName(frameIdx, false);
-            if (!frameName.StartsWith("STARTING TASK", StringComparison.Ordinal))
-            {
-                return StackSourceFrameIndex.Invalid;
-            }
-
-            return frameIdx;
+            Debug.Assert(parentStack != CallStackIndex.Invalid);
+            Debug.Assert(curStack != CallStackIndex.Invalid);
+            return FindThreadPoolTransition(parentStack, 1) == parentStack;
         }
 
         /// <summary>
-        /// Create a stack which is executing at 'startStack' and finds the region until 'stopStack', appending that (in order) to 'baseStack'.  
+        /// Create a stack which is executing at 'stackStart' and finds the region until 'stackStio', appending that (in order) to 'stackStart'.  
+        /// 'entry' is a cache entry and is optional.  It should be the cache entry for 'stackStart'.  If it is non-null we search there, and 
+        /// also update the entry with the CallStack->StackSource mapping
         /// </summary>
-        private StackSourceCallStackIndex SpliceStack(CallStackIndex startStack, CallStackIndex stopStack, StackSourceCallStackIndex baseStack)
+        private StackSourceCallStackIndex SpliceStack(CallStackIndex stackStart, CallStackIndex stackStop, StackSourceCallStackIndex baseStack, CallStackCache.CacheEntry entry)
         {
-            if (startStack == CallStackIndex.Invalid || startStack == stopStack)
-            {
+            if (stackStart == CallStackIndex.Invalid || stackStart == stackStop)
                 return baseStack;
-            }
 
-            var codeAddress = m_eventLog.CallStacks.CodeAddressIndex(startStack);
-            var caller = m_eventLog.CallStacks.Caller(startStack);
-            var callerStack = SpliceStack(caller, stopStack, baseStack);
-            var frameIdx = m_outputSource.GetFrameIndex(codeAddress);
-            StackSourceCallStackIndex result = m_outputSource.Interner.CallStackIntern(frameIdx, callerStack);
+            if (entry != null && entry._toTaskIndex != StackSourceCallStackIndex.Invalid)
+                return entry._toTaskIndex;
 
-            if (m_callStackCache != null)
+            var codeAddress = m_eventLog.CallStacks.CodeAddressIndex(stackStart);
+            var caller = m_eventLog.CallStacks.Caller(stackStart);
+            CallStackCache.CacheEntry nextEntry = null;
+            if (entry != null)
             {
-                m_callStackCache.Put(startStack, result);
+                nextEntry = m_callStackCache.GetEntryForUpdate(caller, entry._fromActivityIndex);
+                nextEntry._taskDepth = entry._taskDepth;
             }
+            var callerStack = SpliceStack(caller, stackStop, baseStack, nextEntry);
+            var frameIdx = m_outputSource.GetFrameIndex(codeAddress);
+            var ret = m_outputSource.Interner.CallStackIntern(frameIdx, callerStack);
 
-            return result;
+            if (entry != null)
+                entry._toTaskIndex = ret;
+            return ret;
         }
 
         /// <summary>
@@ -1222,7 +1435,7 @@ namespace Microsoft.Diagnostics.Tracing
         /// Basically we find the closest to execution (furthest from thread-start) call to a 'Run' method
         /// that shows we are running an independent task.  
         /// </summary>
-        private CallStackIndex FindThreadPoolTransition(CallStackIndex callStackIndex)
+        private CallStackIndex FindThreadPoolTransition(CallStackIndex callStackIndex, int maxSearch = int.MaxValue)
         {
             if (m_methodFlags == null)
             {
@@ -1232,7 +1445,8 @@ namespace Microsoft.Diagnostics.Tracing
             CodeAddressIndex codeAddressIndex = CodeAddressIndex.Invalid;
             CallStackIndex ret = CallStackIndex.Invalid;
             CallStackIndex curFrame = callStackIndex;
-            while (curFrame != CallStackIndex.Invalid)
+            int searchCount = 0;
+            while (curFrame != CallStackIndex.Invalid && searchCount < maxSearch)
             {
                 codeAddressIndex = m_eventLog.CallStacks.CodeAddressIndex(curFrame);
                 MethodIndex methodIndex = m_eventLog.CodeAddresses.MethodIndex(codeAddressIndex);
@@ -1261,6 +1475,7 @@ namespace Microsoft.Diagnostics.Tracing
                 }
 
                 curFrame = m_eventLog.CallStacks.Caller(curFrame);
+                searchCount++;
             }
             // This happens after the of end of the task or on broken stacks.  
             return CallStackIndex.Invalid;
@@ -1374,7 +1589,14 @@ namespace Microsoft.Diagnostics.Tracing
         private TraceEvent m_curEvent;                                  // used for diagnostics, like to remove it...
         private GCReferenceComputer m_gcReferenceComputer;
 
-        private CallStackCache m_callStackCache;                  // Speeds things up by remembering previously computed entries. 
+        /* This is set before GetCallStackWithActivityFrames is called */
+        private ushort m_recursion;                                     // The number of times GetCallStackWithActivityFrames is called recursively.
+        private bool m_overflowFrame;                                   // We inserted a overflow frame
+
+        /* These are set before GetCallStackWithActivityFrames returns */
+        private ushort m_retTaskDepth;                                  // The task depth of the last call to  GetCallStackWithActivityFrames
+
+        private CallStackCache m_callStackCache;                        // Speeds things up by remembering previously computed entries. 
 
         #endregion
     }
