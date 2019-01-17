@@ -607,7 +607,17 @@ namespace Microsoft.Diagnostics.Tracing
                 if (eventName == null)
                 {
                     var taskName = TaskName;
-                    if (Opcode == TraceEventOpcode.Info || eventNameIsJustTaskName || string.IsNullOrEmpty(OpcodeName))
+                    if (Opcode == TraceEventOpcode.Info)
+                    {
+#if false
+                        // This is a WPP event
+                        if (ID != (TraceEventID)0  && ID != TraceEventID.Illegal && taskGuid != Guid.Empty)
+                            eventName = taskName + "/EventID(" + ID.ToString() + ")";
+                        else
+#endif
+                        eventName = taskName;   // We drop the 'Info' opcode.name
+                    }
+                    else if (eventNameIsJustTaskName || string.IsNullOrEmpty(OpcodeName))
                     {
                         eventName = taskName;
                     }
@@ -1353,29 +1363,6 @@ namespace Microsoft.Diagnostics.Tracing
             XmlAttrib(sb, "ProcessorNumber", ProcessorNumber);
             sb.AppendLine().Append(" ");
 
-#if !DOTNET_V35
-            if (ActivityID != Guid.Empty || RelatedActivityID != Guid.Empty)
-            {
-                if (ActivityID != Guid.Empty)
-                {
-                    XmlAttrib(sb, "ActivityID", StartStopActivityComputer.ActivityPathString(ActivityID));
-                    if (StartStopActivityComputer.IsActivityPath(ActivityID, ProcessID))        // Also print out the raw GUID
-                    {
-                        XmlAttrib(sb, "RawActivityID", ActivityID);
-                    }
-                }
-                if (RelatedActivityID != Guid.Empty)
-                {
-                    XmlAttrib(sb, "RelatedActivityID", StartStopActivityComputer.ActivityPathString(RelatedActivityID));
-                    if (StartStopActivityComputer.IsActivityPath(RelatedActivityID, ProcessID))   // Also print out the raw GUID
-                    {
-                        XmlAttrib(sb, "RawRelatedActivityID", RelatedActivityID);
-                    }
-                }
-                sb.AppendLine().Append(" ");
-            }
-#endif
-
             XmlAttrib(sb, "Opcode", (int)Opcode);
             if (taskGuid != Guid.Empty)
             {
@@ -1833,10 +1820,27 @@ namespace Microsoft.Diagnostics.Tracing
             sb.Append(" PID="); QuotePadLeft(sb, ProcessID.ToString(), 6);
             sb.Append(" PName="); QuotePadLeft(sb, ProcessName, 10);
             sb.Append(" TID="); QuotePadLeft(sb, ThreadID.ToString(), 6);
-            if (ActivityID != Guid.Empty)
+#if !DOTNET_V35
+            if (ActivityID != Guid.Empty || RelatedActivityID != Guid.Empty)
             {
-                sb.AppendFormat(" ActivityID=\"{0:n}\"", ActivityID);
+                if (ActivityID != Guid.Empty)
+                {
+                    XmlAttrib(sb, "ActivityID", StartStopActivityComputer.ActivityPathString(ActivityID));
+                    if (StartStopActivityComputer.IsActivityPath(ActivityID, ProcessID))        // Also print out the raw GUID
+                    {
+                        XmlAttrib(sb, "RawActivityID", ActivityID);
+                    }
+                }
+                if (RelatedActivityID != Guid.Empty)
+                {
+                    XmlAttrib(sb, "RelatedActivityID", StartStopActivityComputer.ActivityPathString(RelatedActivityID));
+                    if (StartStopActivityComputer.IsActivityPath(RelatedActivityID, ProcessID))   // Also print out the raw GUID
+                    {
+                        XmlAttrib(sb, "RawRelatedActivityID", RelatedActivityID);
+                    }
+                }
             }
+#endif
 
             sb.Append(" EventName=\"").Append(EventName).Append('"');
             return sb;
@@ -1855,7 +1859,7 @@ namespace Microsoft.Diagnostics.Tracing
         /// </summary>
         internal int ThreadIDforStacks()
         {
-#if !NOT_WINDOWS 
+#if !NOT_WINDOWS
             if (0 <= ParentThread)
             {
                 Debug.Assert(this is ProcessTraceData || this is ThreadTraceData);

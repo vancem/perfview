@@ -23,7 +23,7 @@ namespace Microsoft.Diagnostics.Tracing
 {
     /// <summary>
     /// Calculates start-stop activities (computes duration),  It uses the 'standard' mechanism of using 
-    /// ActivityIDs to corelate the start and stop (and any other events between the start and stop, 
+    /// ActivityIDs to correlate the start and stop (and any other events between the start and stop, 
     /// and use the RelatedActivityID on START events to indicate the creator of the activity, so you can
     /// form nested start-stop activities.   
     /// </summary>
@@ -34,7 +34,6 @@ namespace Microsoft.Diagnostics.Tracing
         /// </summary>
         public StartStopActivityComputer(TraceLogEventSource source, ActivityComputer taskComputer)
         {
-            taskComputer.NoCache = true;            // Can't cache start-stops (at the moment)
             m_source = source;
             m_activeStartStopActivities = new Dictionary<StartStopKey, StartStopActivity>();
             m_taskComputer = taskComputer;
@@ -60,7 +59,7 @@ namespace Microsoft.Diagnostics.Tracing
 
             // Only need to fix up V4.6 Windows-ASP activity ids.   It can be removed after we
             // don't care about V4.6 runtimes (since it is fixed in V4.6.2 and beyond). 
-            // It basicaly remembers the related activity ID of the last RequestSend event on
+            // It basically remembers the related activity ID of the last RequestSend event on
             // each thread, which we use to fix the activity ID of the RequestStart event 
             KeyValuePair<Guid, Guid>[] threadToLastAspNetGuids = new KeyValuePair<Guid, Guid>[m_source.TraceLog.Threads.Count];
 #if HTTP_SERVICE_EVENTS
@@ -863,6 +862,7 @@ namespace Microsoft.Diagnostics.Tracing
             }
             SetActiveStartStopActivityTable(activity.ActivityID, data.ProcessID, activity);       // Put it in our table of live activities.  
             m_traceActivityToStartStopActivity.Set((int)taskIndex, activity);
+            m_taskComputer.ClearCache(); // Any change to the start-stop activities invalidates the cache.  
 
             // Issue callback if requested AFTER state update
             var onStartAfter = Start;
@@ -964,6 +964,8 @@ namespace Microsoft.Diagnostics.Tracing
                     Trace.WriteLine("Warning: Unmatched stop at " + data.TimeStampRelativeMSec.ToString("n3") + " ID = " + activityIdValue);
                 }
             }
+
+            m_taskComputer.ClearCache(); // Any change to the start-stop activities invalidates the cache.  
         }
 
         /// <summary>
